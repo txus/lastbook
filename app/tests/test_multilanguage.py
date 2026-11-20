@@ -53,12 +53,28 @@ class EnglishQuery(unittest.TestCase):
             return assistant.english_query('Com puc fer que l’aigua sigui potable?', lambda: False, lambda ev: None), fake
 
     def test_first_line_cleaned(self):
-        q, fake = self.ask('"make water safe to drink without electricity"\nboil chlorine')
+        q, fake = self.ask(' "make water safe to drink without electricity"\nboil chlorine')
         self.assertEqual(q, 'make water safe to drink without electricity')
-        self.assertEqual(fake.asked[0][1], 48)          # a short generation, not a whole answer
+        segments, max_tokens = fake.asked[0]
+        self.assertEqual(max_tokens, 48)                # a short generation, not a whole answer
+        self.assertEqual(segments[-1], ['QUERY:', False])   # the reply is started for the model
+
+    def test_repeats_after_stray_marks_are_cut(self):
+        """E4B on a German question: the query, then stray closing marks and the query again."""
+        q, _ = self.ask(' food refrigerator without power safe time<channel|>\n<channel|>\n<channel|>QUERY: food refrigerator')
+        self.assertEqual(q, 'food refrigerator without power safe time')
+
+    def test_narration_is_not_searched(self):
+        """E4B without the started reply: a sentence about the task instead of a query."""
+        q, _ = self.ask('The user wants me to convert a Catalan question ("How can I make water potable?") into a short English search query.')
+        self.assertIsNone(q)
+
+    def test_bare_key_words_are_accepted(self):
+        q, _ = self.ask('purify drinking water no electricity')
+        self.assertEqual(q, 'purify drinking water no electricity')
 
     def test_thinking_is_dropped(self):
-        q, _ = self.ask('The user asks about water.<channel|>purify drinking water')
+        q, _ = self.ask(' purify drinking water<|channel>thought\nmore')
         self.assertEqual(q, 'purify drinking water')
 
     def test_no_model_means_search_as_typed(self):

@@ -620,8 +620,9 @@ def _fit_prompt(msgs, tools, llm_local):
 def english_query(question, cancelled, emit):
     """A short English search query for a question in another language, from the model itself (a few seconds), or None
     when no model is running or it fails: the search then uses the question as typed."""
-    msgs = [{'role': 'system', 'content': 'Rewrite the question as a short English search query for a library of survival and health '
-                                          'manuals: the key words only, no answer, no quotes. Reply with the query alone, on one line.'},
+    msgs = [{'role': 'system', 'content': 'The library of survival and health manuals is in English. Translate the question into a short '
+                                          'English search query: the key words only, in English, no answer, no explanation. Reply with one '
+                                          'line in exactly this form, for example:\nQUERY: purify drinking water without electricity'},
             {'role': 'user', 'content': question[:600]}]
     try:
         if local_on():
@@ -629,16 +630,32 @@ def english_query(question, cancelled, emit):
             if LOCAL.ensure_running(lambda pct: emit({'type': 'state', 'state': 'starting', 'pct': pct}), cancelled):
                 return None
             text = ['']
-            LOCAL.generate(llm_local.render(msgs, None), 48, cancelled, lambda t: text.__setitem__(0, text[0] + t))
-            out = llm_local.hide_thinking(text[0])
+            # The reply is started with "QUERY:" so the model writes the query at once: E2B and E4B otherwise narrate the
+            # task in plain text first ("The user wants me to convert...") even with thinking off.
+            LOCAL.generate(llm_local.render(msgs, None) + [['QUERY:', False]], 48, cancelled,
+                           lambda t: text.__setitem__(0, text[0] + t))
+            # the query is the reply's first line; E4B may repeat it after stray "<channel|>" marks, which end it
+            first = re.split(r'<\|?channel\|?>', text[0], 1)[0].strip() or llm_local.hide_thinking(text[0])
+            out = 'QUERY:' + first.split('\n', 1)[0]
+            if not query_line(out):
+                print('assistant: english query unusable:', repr(text[0][:200]), flush=True)
         else:
             got = _http_round(msgs, None, cancelled, lambda piece: None, lambda state: None)
             out = got[0] if isinstance(got, tuple) else ''
     except Exception as e:   # a failed rewrite only means the search uses the question as typed
         print('assistant: english query:', type(e).__name__, e, flush=True)
         return None
-    line = next((l.strip(' "\'`*') for l in (out or '').splitlines() if l.strip()), '')
-    return line[:200] or None
+    return query_line(out)
+
+
+def query_line(out):
+    """The query from a rewrite reply ("QUERY: key words"), or None when the line is a sentence about the task rather than
+    key words ("The user wants me to..."), which would search for the wrong thing."""
+    line = next((l for l in (out or '').splitlines() if l.strip(' "\'`*')), '')
+    line = re.sub(r'(?i)^\s*(?:search\s+)?query\s*:', '', line).strip(' "\'`*')
+    if not line or len(line.split()) > 12 or re.match(r'(?i)(the user|the question|i (need|will|should|am)|okay|let me|sure)\b', line):
+        return None
+    return line[:200]
 
 
 def chat(messages, about, emit, cancelled):
@@ -660,10 +677,9 @@ def chat(messages, about, emit, cancelled):
                      f'answer in {lang.name(language)}, keeping the source keys like [S1] and document titles as they are.'})
     if question and not about:
         english = english_query(question, cancelled, emit) if language != 'en' else None
-        hits = hybrid(english, 8) if english else []
-        seen = {(h['doc_id'], h.get('page'), h.get('t')) for h in hits}
-        hits += [h for h in hybrid(question[:300], 8) if (h['doc_id'], h.get('page'), h.get('t')) not in seen]
-        hits = hits[:8]
+        if english:   # the question as typed would match English pages only by accident: search the English alone
+            print(f'assistant: {language} question searched as: {english}', flush=True)
+        hits = hybrid((english or question)[:300], 8)
         wiki = encyclopedia_hits((english or question)[:300], limit=encyclopedias.INITIAL_LIMIT, excerpt=encyclopedias.INITIAL_CHARS)
         blocks = []
         for n, h in enumerate(hits):
