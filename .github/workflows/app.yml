@@ -144,8 +144,104 @@ jobs:
           name: linux
           path: dist/*.deb
 
+  windows:
+    needs: manifest
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest
+          path: ${{ runner.temp }}
+      - name: Pinned Windows build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'lastbook-tools'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          function Get-PinnedFile([string]$Url, [string]$Out, [string]$Hash) {
+            Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Out
+            if ((Get-FileHash -Algorithm SHA256 $Out).Hash.ToLowerInvariant() -ne $Hash) { throw "SHA-256 mismatch: $Url" }
+          }
+          # These portable releases are deliberately checked before extraction.
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          Get-PinnedFile 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip' $llvm 'fd5462b7f5d93b2ff981fcd3f9c7e427e47f3203c64ea91c27bcc444eebd74cd'
+          Expand-Archive -Force $llvm $tools
+          $cmake = Join-Path $env:RUNNER_TEMP 'cmake.zip'
+          Get-PinnedFile 'https://github.com/Kitware/CMake/releases/download/v4.4.0/cmake-4.4.0-windows-x86_64.zip' $cmake '156d70eb7625a7b469444df7d0861d2af8d5d0a437fce32c350372b08f5620e8'
+          Expand-Archive -Force $cmake $tools
+          $ninja = Join-Path $env:RUNNER_TEMP 'ninja.zip'
+          Get-PinnedFile 'https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip' $ninja '07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65'
+          Expand-Archive -Force $ninja $tools
+          git clone --quiet --depth 1 --branch vulkan-sdk-1.4.350.1 https://github.com/KhronosGroup/Vulkan-Headers "$tools/vulkan-headers"
+          if ((git -C "$tools/vulkan-headers" rev-parse HEAD) -notlike '8864cdc8*') { throw 'Vulkan-Headers is not the requested revision' }
+          git clone --quiet --depth 1 --branch vulkan-sdk-1.4.350.1 https://github.com/KhronosGroup/SPIRV-Headers "$tools/spirv-headers"
+          if ((git -C "$tools/spirv-headers" rev-parse HEAD) -notlike 'ad9184e7*') { throw 'SPIRV-Headers is not the requested revision' }
+          # MSYS2 verifies the signed repository database and package signatures.  glslc and gendef are build-only.
+          & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --needed --noconfirm mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-tools-git'
+          if ($LASTEXITCODE -ne 0) { throw 'MSYS2 package verification or installation failed' }
+          New-Item -ItemType Directory -Force -Path "$tools\msys\ucrt64" | Out-Null
+          robocopy 'C:\msys64\ucrt64\bin' "$tools\msys\ucrt64\bin" /E /NFL /NDL /NJH /NJS
+          if ($LASTEXITCODE -gt 1) { throw 'Could not stage the signed MSYS2 build tools' }
+          $pyPkg = Join-Path $env:RUNNER_TEMP 'python.3.14.10.nupkg'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://api.nuget.org/v3-flatcontainer/python/3.14.10/python.3.14.10.nupkg' -OutFile $pyPkg
+          nuget verify -Signatures $pyPkg
+          if ($LASTEXITCODE -ne 0) { throw 'The Python NuGet package signature is invalid' }
+          Expand-Archive -Force $pyPkg "$tools\python"
+          $py = (Get-ChildItem -Path "$tools\python" -Recurse -Filter python.exe | Select-Object -First 1).FullName
+          if (-not $py) { throw 'python.exe was not found in the verified Python NuGet package' }
+          & $py -I -m ensurepip --upgrade
+          & $py -I -m pip install --disable-pip-version-check --no-input -r packaging/requirements_app.txt certifi
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install the pinned application requirements' }
+          # The signed Microsoft package is unpacked only after NuGet verifies it.  The app build
+          # independently pins the three shipped DLL hashes, so both package provenance and payload
+          # identity are checked before PyInstaller can consume them.
+          $webViewPkg = Join-Path $env:RUNNER_TEMP 'microsoft.web.webview2.1.0.3856.49.nupkg'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3856.49/microsoft.web.webview2.1.0.3856.49.nupkg' -OutFile $webViewPkg
+          nuget verify -Signatures $webViewPkg
+          if ($LASTEXITCODE -ne 0) { throw 'The Microsoft.Web.WebView2 NuGet package signature is invalid' }
+          $webViewExtract = Join-Path $tools 'webview2-package'
+          Expand-Archive -Force $webViewPkg $webViewExtract
+          $webViewOut = Join-Path $env:GITHUB_WORKSPACE 'app\webview2'
+          New-Item -ItemType Directory -Force -Path $webViewOut | Out-Null
+          Copy-Item (Join-Path $webViewExtract 'lib\net462\Microsoft.Web.WebView2.Core.dll') $webViewOut
+          Copy-Item (Join-Path $webViewExtract 'lib\net462\Microsoft.Web.WebView2.WinForms.dll') $webViewOut
+          Copy-Item (Join-Path $webViewExtract 'build\native\x64\WebView2Loader.dll') $webViewOut
+          "TOOLS_WIN=$tools" | Add-Content -Path $env:GITHUB_ENV
+          "PY_WIN=$py" | Add-Content -Path $env:GITHUB_ENV
+      - name: The fork's name, download site and TLS roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp packaging/fork/distribution.json distribution.json
+          "$PY_WIN" -I -B packaging/setup_roots.py "$("$PY_WIN" -I -c 'import certifi; print(certifi.where())')"
+      - name: The local AI runner (llama.cpp, Vulkan and CPU)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLS="$TOOLS_WIN" bash packaging/llm/build_llm_windows.sh
+      - name: The app and per-user installer
+        shell: bash
+        env:
+          PACKS: ${{ runner.temp }}\manifest-v1.json
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE\\derived\\app-build\\windows"
+          PY="$PY_WIN" OUT="$OUT" bash packaging/build_app_windows.sh
+          PY="$PY_WIN" DIST="$OUT\\dist\\Lastbook" OUT="$OUT" CLANG="$TOOLS_WIN\\llvm-mingw-20261020-ucrt-x86_64\\bin\\clang.exe" bash packaging/build_setup_windows.sh
+          mkdir -p dist
+          cp "$OUT/Lastbook-1.1.13-Setup.exe" "dist/Lastbook-Fork-$VERSION-Setup.exe"
+          (cd dist && sha256sum *.exe > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+
   release:
-    needs: [macos, linux]
+    needs: [macos, linux, windows]
     if: ${{ github.ref_type == 'tag' || inputs.publish }}
     runs-on: ubuntu-24.04
     steps:
@@ -157,7 +253,7 @@ jobs:
       - name: Publish
         run: |
           APP_VERSION="$(grep -oE "version='[0-9.]+'" packaging/lastbook_macos.spec | head -1 | cut -d"'" -f2)"
-          printf '{"version": 1, "mac": {"version": "%s", "min_os": "14.0"}, "linux": {"version": "%s", "min_os": "24.04"}}\n' "$APP_VERSION" "$APP_VERSION" > dist/app-v1.json
+          printf '{"version": 1, "mac": {"version": "%s", "min_os": "14.0"}, "windows": {"version": "%s", "min_os": "10.0"}, "linux": {"version": "%s", "min_os": "24.04"}}\n' "$APP_VERSION" "$APP_VERSION" "$APP_VERSION" > dist/app-v1.json
           (cd dist && sha256sum * > SHA256SUMS.txt)
           gh release view "$VERSION" >/dev/null 2>&1 || gh release create "$VERSION" --title "$VERSION" --notes "Built by the App workflow from $GITHUB_SHA."
           gh release upload "$VERSION" dist/* --clobber
