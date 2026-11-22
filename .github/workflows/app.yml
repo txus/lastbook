@@ -231,7 +231,11 @@ jobs:
           PY="$PY_WIN" OUT="$OUT" bash packaging/build_app_windows.sh
           PY="$PY_WIN" DIST="$OUT\\dist\\Lastbook" OUT="$OUT" CLANG="$TOOLS_WIN\\llvm-mingw-20261020-ucrt-x86_64\\bin\\clang.exe" bash packaging/build_setup_windows.sh
           mkdir -p dist
-          cp "$OUT/Lastbook-1.1.13-Setup.exe" "dist/Lastbook-Fork-$VERSION-Setup.exe"
+          # the installer is named after the app's own version (packaging/lastbook_macos.spec), which moves with upstream
+          shopt -s nullglob
+          SETUP=("$(cygpath -u "$OUT")"/Lastbook-*-Setup.exe)
+          [ "${#SETUP[@]}" -eq 1 ] || { echo "expected one Lastbook-*-Setup.exe in $OUT, found ${#SETUP[@]}: ${SETUP[*]}"; exit 1; }
+          cp "${SETUP[0]}" "dist/Lastbook-Fork-$VERSION-Setup.exe"
           (cd dist && sha256sum *.exe > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:
